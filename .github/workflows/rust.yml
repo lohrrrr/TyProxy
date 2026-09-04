@@ -20,7 +20,7 @@ jobs:
             archive: zip
     steps:
       - uses: actions/checkout@master
-      - uses: dtolnay/rust-toolchain@stable  # or use @nightly if needed
+      - uses: dtolnay/rust-toolchain@nightly
       - name: Compile and release
         uses: rust-build/rust-build.action@v1.4.5
         env:
