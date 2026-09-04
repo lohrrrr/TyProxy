@@ -46,8 +46,13 @@ impl ServerCertVerifier for NoCertificateVerification {
     }
 }
 
-pub fn generate_self_signed_cert(
-) -> Result<(Vec<CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>), DynError> {
+pub fn generate_self_signed_cert() -> Result<
+    (
+        Vec<CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    DynError,
+> {
     let cert = rcgen::generate_simple_self_signed(vec!["typroxy".to_string()])?;
     let cert_der = cert.cert.der().to_vec();
     let key_der = cert.key_pair.serialize_der();

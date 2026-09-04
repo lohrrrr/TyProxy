@@ -16,13 +16,19 @@ pub struct Config {
 pub struct ServerConfig {
     pub bind_addr: String,
     pub wallet_path: String,
+    pub tun_enabled: bool,
+    pub tun_name: String,
+    pub tun_ip: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClientConfig {
     pub server_host: String,
-    pub expected_server_id: Option<u32>,
+    pub routing_mode: String, // "socks5" или "tun"
     pub socks_bind_addr: String,
+    pub tun_name: String,
+    pub tun_ip: String,
+    pub tun_gateway: String,
 }
 
 impl Default for Config {
@@ -32,11 +38,17 @@ impl Default for Config {
             server: ServerConfig {
                 bind_addr: "0.0.0.0:8888".to_string(),
                 wallet_path: "server.wallet".to_string(),
+                tun_enabled: true,
+                tun_name: "typroxy-srv".to_string(),
+                tun_ip: "10.8.0.1".to_string(),
             },
             client: ClientConfig {
                 server_host: "127.0.0.1:8888".to_string(),
-                expected_server_id: None,
+                routing_mode: "socks5".to_string(), // "socks5" или "tun"
                 socks_bind_addr: "127.0.0.1:1080".to_string(),
+                tun_name: "typroxy-tun".to_string(),
+                tun_ip: "10.8.0.2".to_string(),
+                tun_gateway: "10.8.0.1".to_string(),
             },
         }
     }
@@ -44,23 +56,33 @@ impl Default for Config {
 
 pub fn load_or_create_config(path: &str) -> Result<Config, DynError> {
     if !Path::new(path).exists() {
-        let annotated_toml = format!(
-            "# Режим запуска: \"server\", \"client\" или \"ask\" (спрашивать при старте)\n\
-            mode = \"ask\"\n\n\
-            [server]\n\
-            bind_addr = \"0.0.0.0:8888\"\n\
-            wallet_path = \"server.wallet\"\n\n\
-            [client]\n\
-            server_host = \"127.0.0.1:8888\"\n\
-            # expected_server_id = 945928  # Раскомментируйте для проверки ID сервера\n\
-            socks_bind_addr = \"127.0.0.1:1080\"\n"
-        );
+        let annotated_toml = r#"# Режим запуска: "server", "client" или "ask"
+        mode = "ask"
 
+        [server]
+        bind_addr = "0.0.0.0:8888"
+        wallet_path = "server.wallet"
+        tun_enabled = true
+        tun_name = "typroxy-srv"
+        tun_ip = "10.8.0.1"
+
+        [client]
+        server_host = "127.0.0.1:8888"
+        # routing_mode: "socks5" или "tun"
+        routing_mode = "socks5"
+        socks_bind_addr = "127.0.0.1:1080"
+
+        # Настройки для TUN режима (требуются root/admin права) (не работает в Termux билде без ROOT прав)
+        tun_name = "typroxy-tun"
+        tun_ip = "10.8.0.2"
+        tun_gateway = "10.8.0.1"
+        "#;
         fs::write(path, annotated_toml)?;
 
-        println!("[!] Вы запустили программу в первый раз.");
-        println!("[!] Файл конфигурации '{}' был автоматически создан.", path);
-        println!("[!] Отредактируйте конфигурационный файл и запустите снова.");
+        println!(
+            "[!] Конфигурационный файл '{}' создан. Отредактируйте его и перезапустите приложение.",
+            path
+        );
         std::process::exit(0);
     }
 
@@ -76,7 +98,7 @@ pub fn select_mode(configured_mode: &str) -> String {
         _ => {
             println!("=== Выберите режим работы TyProxy ===");
             println!("[1] Host Server (Запустить сервер)");
-            println!("[2] Connect Server (Запустить SOCKS5 клиент)");
+            println!("[2] Connect Client (Запустить клиент)");
             print!("Ваш выбор [1/2]: ");
             io::stdout().flush().unwrap();
 

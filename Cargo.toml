@@ -4,17 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
-rustls = { version = "0.23", features = ["ring"] }
+tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rcgen = "0.13"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
-tun-rs = { version = "2.7.3", features = ["async"] }
+tun = { version = "0.6", features = ["async"] }
 
-[target.x86_64-pc-windows-gnu]
-linker = "x86_64-w64-mingw32-gcc"
-
-[target.aarch64-linux-android]
-linker = "/home/belgia/android-ndk-r27d/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
-ar = "/home/belgia/android-ndk-r27d/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
