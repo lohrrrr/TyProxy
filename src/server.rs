@@ -21,8 +21,8 @@ type OutboundSocketsPool = Arc<Mutex<HashMap<u64, SocketTx>>>;
 pub async fn run_server(cfg: ServerConfig) -> Result<(), DynError> {
     let (certs, key) = generate_self_signed_cert()?;
     let mut server_tls_config = RustlsServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
+    .with_no_client_auth()
+    .with_single_cert(certs, key)?;
 
     server_tls_config.alpn_protocols = vec![b"typroxy".to_vec()];
 
@@ -31,30 +31,30 @@ pub async fn run_server(cfg: ServerConfig) -> Result<(), DynError> {
     println!("[*] Запущен TLS TyProxy Сервер на {}", cfg.bind_addr);
 
     let server_tun_tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>> = Arc::new(Mutex::new(None));
-    let clients_tun_broadcast: Arc<Mutex<Vec<mpsc::Sender<Vec<u8>>>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let clients_tun_broadcast: Arc<Mutex<Vec<mpsc::Sender<Vec<u8>>>>> = Arc::new(Mutex::new(Vec::new()));
 
     if cfg.tun_enabled {
-        let mut tun_cfg = tun::Configuration::default();
-        let tun_ip: std::net::Ipv4Addr = cfg.tun_ip.parse()?;
-        tun_cfg
+        let dev_result = {
+            let mut tun_cfg = tun::Configuration::default();
+            let tun_ip: std::net::Ipv4Addr = cfg.tun_ip.parse()?;
+            tun_cfg
             .name(&cfg.tun_name)
             .address(tun_ip)
             .netmask((255, 255, 255, 0))
             .destination("10.8.0.2".parse::<std::net::Ipv4Addr>()?)
             .up();
 
-        #[cfg(target_os = "linux")]
-        tun_cfg.platform(|c| {
-            c.packet_information(false);
-        });
+            #[cfg(target_os = "linux")]
+            tun_cfg.platform(|c| {
+                c.packet_information(false);
+            });
 
-        match tun::create_as_async(&tun_cfg) {
+            tun::create_as_async(&tun_cfg)
+        };
+
+        match dev_result {
             Ok(dev) => {
-                println!(
-                    "[+] Серверный TUN-интерфейс '{}' (IP: {}) готов к трансляции",
-                    cfg.tun_name, cfg.tun_ip
-                );
+                println!("[+] Серверный TUN-интерфейс '{}' (IP: {}) готов к трансляции", cfg.tun_name, cfg.tun_ip);
                 let (mut tun_r, mut tun_w) = tokio::io::split(dev);
 
                 let (tx, mut rx) = mpsc::channel::<Vec<u8>>(2048);
@@ -81,10 +81,7 @@ pub async fn run_server(cfg: ServerConfig) -> Result<(), DynError> {
                 });
             }
             Err(e) => {
-                eprintln!(
-                    "[-] Не удалось поднять TUN на сервере (требуются права root): {}",
-                    e
-                );
+                eprintln!("[-] Не удалось поднять TUN на сервере (требуются права root): {}", e);
             }
         }
     }
@@ -168,8 +165,7 @@ async fn handle_client(
                                 } else {
                                     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "No IP"))
                                 }
-                            })
-                            .await;
+                            }).await;
 
                             if let Ok(Ok(outbound_stream)) = connect_result {
                                 let (mut out_reader, mut out_writer) = outbound_stream.into_split();
@@ -182,17 +178,10 @@ async fn handle_client(
                                         loop {
                                             let n = match out_reader.read(&mut buf).await {
                                                 Ok(0) | Err(_) => break,
-                                                Ok(n) => n,
+                                                 Ok(n) => n,
                                             };
-                                            let packet =
-                                                build_packet(0, conn_id, &key_tx, &buf[..n]);
-                                            if writer_tx
-                                                .lock()
-                                                .await
-                                                .write_all(&packet)
-                                                .await
-                                                .is_err()
-                                            {
+                                            let packet = build_packet(0, conn_id, &key_tx, &buf[..n]);
+                                            if writer_tx.lock().await.write_all(&packet).await.is_err() {
                                                 break;
                                             }
                                         }
@@ -218,39 +207,20 @@ async fn handle_client(
                         let pool_ref = outbound_sockets.clone();
 
                         tokio::spawn(async move {
-                            if let Ok(Ok(mut addrs)) = timeout(
-                                Duration::from_secs(3),
-                                tokio::net::lookup_host(target_key_clone.trim()),
-                            )
-                            .await
-                            {
+                            if let Ok(Ok(mut addrs)) = timeout(Duration::from_secs(3), tokio::net::lookup_host(target_key_clone.trim())).await {
                                 if let Some(target_addr) = addrs.next() {
                                     if let Ok(udp_socket) = UdpSocket::bind("0.0.0.0:0").await {
                                         if udp_socket.connect(target_addr).await.is_ok() {
                                             let socket_arc = Arc::new(udp_socket);
-                                            pool_ref
-                                                .lock()
-                                                .await
-                                                .insert(conn_id, SocketTx::Udp(socket_arc.clone()));
+                                            pool_ref.lock().await.insert(conn_id, SocketTx::Udp(socket_arc.clone()));
 
                                             let _ = socket_arc.send(&raw_payload).await;
                                             let mut buf = [0u8; 65535];
                                             loop {
                                                 match socket_arc.recv(&mut buf).await {
                                                     Ok(n) => {
-                                                        let packet = build_packet(
-                                                            1,
-                                                            conn_id,
-                                                            &target_key_clone,
-                                                            &buf[..n],
-                                                        );
-                                                        if writer_ref
-                                                            .lock()
-                                                            .await
-                                                            .write_all(&packet)
-                                                            .await
-                                                            .is_err()
-                                                        {
+                                                        let packet = build_packet(1, conn_id, &target_key_clone, &buf[..n]);
+                                                        if writer_ref.lock().await.write_all(&packet).await.is_err() {
                                                             break;
                                                         }
                                                     }
@@ -271,6 +241,7 @@ async fn handle_client(
                     }
                 }
                 2 => {
+                    // Raw TUN IP-пакет
                     let lock = server_tun_tx.lock().await;
                     if let Some(tx) = &*lock {
                         let _ = tx.send(raw_payload).await;
@@ -314,9 +285,7 @@ fn parse_client_frame(data: &[u8]) -> Option<(u8, u64, String, Vec<u8>)> {
 
     let raw_key = String::from_utf8_lossy(&data[11..11 + meta_len]).to_string();
     let payload = data[11 + meta_len..].to_vec();
-    let mut target_key = raw_key
-        .trim_matches(|c: char| c == '\0' || c.is_whitespace())
-        .to_string();
+    let mut target_key = raw_key.trim_matches(|c: char| c == '\0' || c.is_whitespace()).to_string();
     if !target_key.contains(':') && !target_key.is_empty() {
         target_key.push_str(":80");
     }
