@@ -4,12 +4,24 @@ use std::io::{self, Write};
 use std::path::Path;
 
 pub type DynError = Box<dyn std::error::Error + Send + Sync>;
+pub type AppConfig = Config;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub mode: String, // "server", "client" или "ask"
     pub server: ServerConfig,
     pub client: ClientConfig,
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Self, DynError> {
+        let path_str = path.to_str().unwrap_or("config.toml");
+        load_or_create_config(path_str)
+    }
+
+    pub fn is_server(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("server")
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -44,7 +56,7 @@ impl Default for Config {
             },
             client: ClientConfig {
                 server_host: "127.0.0.1:8888".to_string(),
-                routing_mode: "socks5".to_string(), // "socks5" или "tun"
+                routing_mode: "socks5".to_string(),
                 socks_bind_addr: "127.0.0.1:1080".to_string(),
                 tun_name: "typroxy-tun".to_string(),
                 tun_ip: "10.8.0.2".to_string(),
@@ -56,7 +68,7 @@ impl Default for Config {
 
 pub fn load_or_create_config(path: &str) -> Result<Config, DynError> {
     if !Path::new(path).exists() {
-        let annotated_toml = r#"# Режим запуска: "server", "client" или "ask"
+        let annotated_toml = r#"# Режим: "server", "client" или "ask"
         mode = "ask"
 
         [server]
@@ -71,18 +83,12 @@ pub fn load_or_create_config(path: &str) -> Result<Config, DynError> {
         # routing_mode: "socks5" или "tun"
         routing_mode = "socks5"
         socks_bind_addr = "127.0.0.1:1080"
-
-        # Настройки для TUN режима (требуются root/admin права) (не работает в Termux билде без ROOT прав)
         tun_name = "typroxy-tun"
         tun_ip = "10.8.0.2"
         tun_gateway = "10.8.0.1"
         "#;
         fs::write(path, annotated_toml)?;
-
-        println!(
-            "[!] Конфигурационный файл '{}' создан. Отредактируйте его и перезапустите приложение.",
-            path
-        );
+        println!("[!] Конфигурационный файл '{}' создан.", path);
         std::process::exit(0);
     }
 
@@ -96,15 +102,13 @@ pub fn select_mode(configured_mode: &str) -> String {
         "server" => "server".to_string(),
         "client" => "client".to_string(),
         _ => {
-            println!("=== Выберите режим работы TyProxy ===");
-            println!("[1] Host Server (Запустить сервер)");
-            println!("[2] Connect Client (Запустить клиент)");
-            print!("Ваш выбор [1/2]: ");
+            println!("=== Выбор режима TyProxy ===");
+            println!("[1] Host Server (Сервер)");
+            println!("[2] Connect Client (Клиент)");
+            print!("Выберите [1/2]: ");
             io::stdout().flush().unwrap();
-
             let mut input = String::new();
             io::stdin().read_line(&mut input).unwrap();
-
             match input.trim() {
                 "2" => "client".to_string(),
                 _ => "server".to_string(),

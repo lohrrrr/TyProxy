@@ -35,7 +35,7 @@ darwin-intel:
 
 bsd:
 	mkdir -p $(DIST_DIR)
-	cargo build --release --target $(TARGET_BSD)
+	cargo zigbuild --release --target $(TARGET_BSD)
 	cp target/$(TARGET_BSD)/release/$(APP_NAME) $(DIST_DIR)/$(APP_NAME)-freebsd-amd64
 
 clean:
