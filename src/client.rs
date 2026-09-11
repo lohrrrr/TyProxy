@@ -27,6 +27,10 @@ pub async fn run_client(cfg: ClientConfig) -> Result<(), DynError> {
 
     let connector = TlsConnector::from(Arc::new(crypto));
     let stream = TcpStream::connect(&cfg.server_host).await?;
+    let connected_ip = match stream.peer_addr() {
+        Ok(std::net::SocketAddr::V4(v4)) => Some(*v4.ip()),
+        _ => None,
+    };
 
     let domain = ServerName::try_from("typroxy")?.to_owned();
     let tls_stream = connector.connect(domain, stream).await?;
@@ -48,7 +52,7 @@ pub async fn run_client(cfg: ClientConfig) -> Result<(), DynError> {
             let w_arc = writer_arc.clone();
             let cfg_clone = cfg.clone();
             tokio::spawn(async move {
-                if let Err(e) = tun::run_tun_module(cfg_clone, w_arc, tun_slot_clone).await {
+                if let Err(e) = tun::run_tun_module(cfg_clone, w_arc, tun_slot_clone, connected_ip).await {
                     eprintln!("[-] Ошибка модуля TUN: {}. Проверьте root/sudo права!", e);
                 }
             });

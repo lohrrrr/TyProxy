@@ -40,13 +40,15 @@ pub async fn run_server(cfg: ServerConfig) -> Result<(), DynError> {
             let tun_ip: std::net::Ipv4Addr = cfg.tun_ip.parse()?;
             let dest_ip: std::net::Ipv4Addr = "10.8.0.2".parse()?;
             tun_cfg
-            .name(&cfg.tun_name)
-            .address(tun_ip)
-            .netmask(std::net::Ipv4Addr::new(255, 255, 255, 0))
-            .destination(dest_ip)
-            .up()
-            .try_build()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                .name(&cfg.tun_name)
+                .tap(false)
+                .packet_info(false)
+                .address(tun_ip)
+                .netmask(std::net::Ipv4Addr::new(255, 255, 255, 0))
+                .destination(dest_ip)
+                .up()
+                .try_build()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
         };
 
         match dev_result {
@@ -55,6 +57,7 @@ pub async fn run_server(cfg: ServerConfig) -> Result<(), DynError> {
                     "[+] Создан TUN-интерфейс '{}' (IP: {})",
                          cfg.tun_name, cfg.tun_ip
                 );
+                setup_server_nat(&cfg.tun_name);
                 let (mut tun_r, mut tun_w) = tokio::io::split(dev);
                 let (tx, mut rx) = mpsc::channel::<Vec<u8>>(2048);
                 *server_tun_tx.lock().await = Some(tx);
@@ -73,7 +76,10 @@ pub async fn run_server(cfg: ServerConfig) -> Result<(), DynError> {
                             if n > 0 {
                                 let pkt = buf[..n].to_vec();
                                 let mut clients = b_clients.lock().await;
-                                clients.retain(|c| c.try_send(pkt.clone()).is_ok());
+                                clients.retain(|c| !c.is_closed());
+                                for c in clients.iter() {
+                                    let _ = c.try_send(pkt.clone());
+                                }
                             }
                         }
                     }
@@ -211,7 +217,7 @@ async fn handle_client(
                 }
                 1 => {
                     // UDP
-                    let mut pool = outbound_sockets.lock().await;
+                    let pool = outbound_sockets.lock().await;
                     if !pool.contains_key(&conn_id) {
                         let target_key_clone = target_key.clone();
                         let writer_ref = writer_arc.clone();
@@ -317,4 +323,66 @@ fn parse_client_frame(data: &[u8]) -> Option<(u8, u64, String, Vec<u8>)> {
         target_key.push_str(":80");
     }
     Some((pkt_type, conn_id, target_key, payload))
+}
+
+#[cfg(target_os = "linux")]
+fn setup_server_nat(tun_name: &str) {
+    use std::process::Command;
+
+    // 1. Enable IPv4 forwarding
+    let forward_ok = Command::new("sysctl")
+        .args(["-w", "net.ipv4.ip_forward=1"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if forward_ok {
+        println!("[+] IPv4 forwarding включен (net.ipv4.ip_forward=1)");
+    } else {
+        eprintln!("[!] Не удалось включить ip_forward автоматически. Выполните: sudo sysctl -w net.ipv4.ip_forward=1");
+    }
+
+    // 2. Configure iptables MASQUERADE
+    let check_nat = Command::new("iptables")
+        .args(["-t", "nat", "-C", "POSTROUTING", "-s", "10.8.0.0/24", "-j", "MASQUERADE"])
+        .output();
+
+    let nat_set = match check_nat {
+        Ok(out) if out.status.success() => true,
+        _ => {
+            Command::new("iptables")
+                .args(["-t", "nat", "-A", "POSTROUTING", "-s", "10.8.0.0/24", "-j", "MASQUERADE"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+    };
+
+    // 3. Configure iptables FORWARD rules
+    let check_fwd_in = Command::new("iptables")
+        .args(["-C", "FORWARD", "-i", tun_name, "-j", "ACCEPT"])
+        .output();
+    if !matches!(check_fwd_in, Ok(out) if out.status.success()) {
+        let _ = Command::new("iptables")
+            .args(["-A", "FORWARD", "-i", tun_name, "-j", "ACCEPT"])
+            .status();
+    }
+
+    let check_fwd_out = Command::new("iptables")
+        .args(["-C", "FORWARD", "-o", tun_name, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"])
+        .output();
+    if !matches!(check_fwd_out, Ok(out) if out.status.success()) {
+        let _ = Command::new("iptables")
+            .args(["-A", "FORWARD", "-o", tun_name, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"])
+            .status();
+    }
+
+    if nat_set {
+        println!("[+] Правила NAT (MASQUERADE) и FORWARD в iptables успешно настроены!");
+    } else {
+        eprintln!("[!] Не удалось автоматически настроить iptables MASQUERADE. Если трафик в туннеле не идет, выполните на сервере от root:");
+        eprintln!("    sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE");
+        eprintln!("    sudo iptables -A FORWARD -i {} -j ACCEPT", tun_name);
+        eprintln!("    sudo iptables -A FORWARD -o {} -m state --state RELATED,ESTABLISHED -j ACCEPT", tun_name);
+    }
 }

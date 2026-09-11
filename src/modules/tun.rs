@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::process::Command;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -26,6 +26,7 @@ pub enum TunError {
     #[error("Command execution failed: {0}")]
     CommandFailed(String),
     #[error("TUN interface is only supported on Linux")]
+    #[allow(dead_code)]
     UnsupportedPlatform,
 }
 
@@ -38,9 +39,11 @@ pub struct RouteInfo {
 /// Restores original routing table state upon tunnel termination.
 pub struct RouteGuard {
     tun_name: String,
-    server_ip: Ipv4Addr,
+    server_ips: Vec<Ipv4Addr>,
     gateway: Option<Ipv4Addr>,
     interface: String,
+    ipv6_blocked: bool,
+    dns_configured: bool,
 }
 
 impl Drop for RouteGuard {
@@ -48,51 +51,56 @@ impl Drop for RouteGuard {
         #[cfg(target_os = "linux")]
         {
             let _ = Command::new("ip")
-            .args(["route", "del", "0.0.0.0/1", "dev", &self.tun_name])
-            .status();
+                .args(["route", "del", "0.0.0.0/1", "dev", &self.tun_name])
+                .status();
             let _ = Command::new("ip")
-            .args(["route", "del", "128.0.0.0/1", "dev", &self.tun_name])
-            .status();
-            if let Some(gw) = self.gateway {
-                let _ = Command::new("ip")
-                .args([
-                    "route",
-                    "del",
-                    &self.server_ip.to_string(),
-                      "via",
-                      &gw.to_string(),
-                ])
+                .args(["route", "del", "128.0.0.0/1", "dev", &self.tun_name])
                 .status();
-            } else {
+
+            if self.ipv6_blocked {
                 let _ = Command::new("ip")
-                .args([
-                    "route",
-                    "del",
-                    &self.server_ip.to_string(),
-                      "dev",
-                      &self.interface,
-                ])
-                .status();
+                    .args(["-6", "route", "del", "unreachable", "default", "metric", "1"])
+                    .status();
+            }
+
+            if self.dns_configured {
+                let _ = Command::new("resolvectl")
+                    .args(["revert", &self.tun_name])
+                    .status();
+            }
+
+            for ip in &self.server_ips {
+                if let Some(gw) = self.gateway {
+                    let _ = Command::new("ip")
+                        .args(["route", "del", &ip.to_string(), "via", &gw.to_string()])
+                        .status();
+                } else {
+                    let _ = Command::new("ip")
+                        .args(["route", "del", &ip.to_string(), "dev", &self.interface])
+                        .status();
+                }
             }
         }
         #[cfg(target_os = "windows")]
         {
             if let Some(gw) = self.gateway {
                 let _ = Command::new("route")
-                .args(["delete", "0.0.0.0", "mask", "128.0.0.0", &gw.to_string()])
-                .status();
+                    .args(["delete", "0.0.0.0", "mask", "128.0.0.0", &gw.to_string()])
+                    .status();
                 let _ = Command::new("route")
-                .args(["delete", "128.0.0.0", "mask", "128.0.0.0", &gw.to_string()])
-                .status();
-                let _ = Command::new("route")
-                .args([
-                    "delete",
-                    &self.server_ip.to_string(),
-                      "mask",
-                      "255.255.255.255",
-                      &gw.to_string(),
-                ])
-                .status();
+                    .args(["delete", "128.0.0.0", "mask", "128.0.0.0", &gw.to_string()])
+                    .status();
+                for ip in &self.server_ips {
+                    let _ = Command::new("route")
+                        .args([
+                            "delete",
+                            &ip.to_string(),
+                            "mask",
+                            "255.255.255.255",
+                            &gw.to_string(),
+                        ])
+                        .status();
+                }
             }
         }
     }
@@ -110,29 +118,47 @@ impl TunDevice {
     pub async fn create(
         tun_name: &str,
         tun_ip: Ipv4Addr,
+        tun_gateway: Option<Ipv4Addr>,
         tun_netmask: Ipv4Addr,
         server_host: &str,
+        connected_ip: Option<Ipv4Addr>,
     ) -> Result<Self, TunError> {
-        let server_ip = resolve_ipv4(server_host)?;
-        let tun = TunBuilder::new()
-        .name(tun_name)
-        .tap(false)
-        .packet_info(false)
-        .address(tun_ip)
-        .netmask(tun_netmask)
-        .up()
-        .try_build()
-        .map_err(TunError::Tun)?;
+        let server_ips = resolve_all_ipv4(server_host, connected_ip);
+        if server_ips.is_empty() {
+            return Err(TunError::Dns(format!(
+                "No IPv4 address found for {}",
+                server_host
+            )));
+        }
+
+        let mut builder = TunBuilder::new()
+            .name(tun_name)
+            .tap(false)
+            .packet_info(false)
+            .address(tun_ip)
+            .netmask(tun_netmask);
+
+        if let Some(gw) = tun_gateway {
+            builder = builder.destination(gw);
+        }
+
+        let tun = builder
+            .up()
+            .try_build()
+            .map_err(TunError::Tun)?;
 
         let actual_name = tun.name().to_string();
         let default_route = get_default_route()?;
-        setup_routes(&actual_name, server_ip, &default_route)?;
+        let (ipv6_blocked, dns_configured) =
+            setup_routes(&actual_name, &server_ips, &default_route, tun_gateway)?;
 
         let guard = RouteGuard {
             tun_name: actual_name,
-            server_ip,
+            server_ips,
             gateway: default_route.gateway,
             interface: default_route.interface,
+            ipv6_blocked,
+            dns_configured,
         };
 
         Ok(Self { tun, guard })
@@ -142,8 +168,10 @@ impl TunDevice {
     pub async fn create(
         _tun_name: &str,
         _tun_ip: Ipv4Addr,
+        _tun_gateway: Option<Ipv4Addr>,
         _tun_netmask: Ipv4Addr,
         _server_host: &str,
+        _connected_ip: Option<Ipv4Addr>,
     ) -> Result<Self, TunError> {
         Err(TunError::UnsupportedPlatform)
     }
@@ -153,14 +181,25 @@ pub async fn run_tun_module(
     cfg: ClientConfig,
     tls_writer: TlsWriterArc,
     tun_slot: TunWriterArc,
+    connected_ip: Option<Ipv4Addr>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(target_os = "linux")]
     {
         let tun_ip: Ipv4Addr = cfg.tun_ip.parse()?;
+        let tun_gateway: Option<Ipv4Addr> = cfg.tun_gateway.parse().ok();
         let netmask: Ipv4Addr = "255.255.255.0".parse()?;
-        let tun_dev = TunDevice::create(&cfg.tun_name, tun_ip, netmask, &cfg.server_host).await?;
+        let tun_dev = TunDevice::create(
+            &cfg.tun_name,
+            tun_ip,
+            tun_gateway,
+            netmask,
+            &cfg.server_host,
+            connected_ip,
+        )
+        .await?;
 
-        let (mut reader, mut writer) = tokio::io::split(tun_dev.tun);
+        let TunDevice { tun, guard: _guard } = tun_dev;
+        let (mut reader, mut writer) = tokio::io::split(tun);
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
         *tun_slot.lock().await = Some(tx);
 
@@ -170,12 +209,12 @@ pub async fn run_tun_module(
             loop {
                 match reader.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                     Ok(n) => {
-                         let packet = crate::client::build_packet(2, 0, "", &buf[..n]);
-                         if writer_tls.lock().await.write_all(&packet).await.is_err() {
-                             break;
-                         }
-                     }
+                    Ok(n) => {
+                        let packet = crate::client::build_packet(2, 0, "", &buf[..n]);
+                        if writer_tls.lock().await.write_all(&packet).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -190,13 +229,18 @@ pub async fn run_tun_module(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (cfg, tls_writer, tun_slot);
+        let _ = (cfg, tls_writer, tun_slot, connected_ip);
         Err(Box::new(TunError::UnsupportedPlatform))
     }
 }
 
 #[allow(dead_code)]
-fn resolve_ipv4(server_host: &str) -> Result<Ipv4Addr, TunError> {
+fn resolve_all_ipv4(server_host: &str, connected_ip: Option<Ipv4Addr>) -> Vec<Ipv4Addr> {
+    let mut ips = Vec::new();
+    if let Some(ip) = connected_ip {
+        ips.push(ip);
+    }
+
     let host = if let Some(idx) = server_host.rfind(':') {
         if !server_host.starts_with('[') {
             &server_host[..idx]
@@ -208,22 +252,24 @@ fn resolve_ipv4(server_host: &str) -> Result<Ipv4Addr, TunError> {
     };
 
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
-        return Ok(ip);
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
+        return ips;
     }
 
     let socket_str = format!("{}:80", host);
-    let addrs: Vec<SocketAddr> = socket_str
-    .to_socket_addrs()
-    .map_err(|e| TunError::Dns(format!("{}: {}", host, e)))?
-    .collect();
-
-    for addr in addrs {
-        if let IpAddr::V4(v4) = addr.ip() {
-            return Ok(v4);
+    if let Ok(addrs) = socket_str.to_socket_addrs() {
+        for addr in addrs {
+            if let IpAddr::V4(v4) = addr.ip() {
+                if !ips.contains(&v4) {
+                    ips.push(v4);
+                }
+            }
         }
     }
 
-    Err(TunError::Dns(format!("No IPv4 address found for {}", host)))
+    ips
 }
 
 #[cfg(target_os = "linux")]
@@ -313,59 +359,104 @@ pub fn get_default_route() -> Result<RouteInfo, TunError> {
 #[cfg(target_os = "linux")]
 fn setup_routes(
     tun_name: &str,
-    server_ip: Ipv4Addr,
+    server_ips: &[Ipv4Addr],
     route_info: &RouteInfo,
-) -> Result<(), TunError> {
-    if let Some(gw) = route_info.gateway {
-        let _ = Command::new("ip")
-        .args([
-            "route",
-            "add",
-            &server_ip.to_string(),
-              "via",
-              &gw.to_string(),
-        ])
-        .status();
-    } else {
-        let _ = Command::new("ip")
-        .args([
-            "route",
-            "add",
-            &server_ip.to_string(),
-              "dev",
-              &route_info.interface,
-        ])
-        .status();
+    tun_gateway: Option<Ipv4Addr>,
+) -> Result<(bool, bool), TunError> {
+    for ip in server_ips {
+        if let Some(gw) = route_info.gateway {
+            let _ = Command::new("ip")
+                .args([
+                    "route",
+                    "add",
+                    &ip.to_string(),
+                    "via",
+                    &gw.to_string(),
+                ])
+                .status();
+        } else {
+            let _ = Command::new("ip")
+                .args([
+                    "route",
+                    "add",
+                    &ip.to_string(),
+                    "dev",
+                    &route_info.interface,
+                ])
+                .status();
+        }
     }
 
-    run_cmd("ip", &["route", "add", "0.0.0.0/1", "dev", tun_name])?;
-    run_cmd("ip", &["route", "add", "128.0.0.0/1", "dev", tun_name])?;
+    if let Some(gw) = tun_gateway {
+        if run_cmd("ip", &["route", "add", "0.0.0.0/1", "via", &gw.to_string(), "dev", tun_name]).is_err() {
+            run_cmd("ip", &["route", "add", "0.0.0.0/1", "dev", tun_name])?;
+        }
+        if run_cmd("ip", &["route", "add", "128.0.0.0/1", "via", &gw.to_string(), "dev", tun_name]).is_err() {
+            run_cmd("ip", &["route", "add", "128.0.0.0/1", "dev", tun_name])?;
+        }
+    } else {
+        run_cmd("ip", &["route", "add", "0.0.0.0/1", "dev", tun_name])?;
+        run_cmd("ip", &["route", "add", "128.0.0.0/1", "dev", tun_name])?;
+    }
 
     let _ = Command::new("sysctl")
-    .args(["-w", &format!("net.ipv4.conf.{}.rp_filter=2", tun_name)])
-    .status();
+        .args(["-w", &format!("net.ipv4.conf.{}.rp_filter=2", tun_name)])
+        .status();
 
-    Ok(())
+    // Prevent IPv6 leaks: block default IPv6 with metric 1 so apps fail-fast to IPv4 TUN
+    let ipv6_blocked = Command::new("ip")
+        .args(["-6", "route", "add", "unreachable", "default", "metric", "1"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if ipv6_blocked {
+        println!("[+] Защита от утечек IPv6 активна (unreachable default ::/0)");
+    }
+
+    // Configure DNS via systemd-resolved (resolvectl) if available
+    let dns_ok = Command::new("resolvectl")
+        .args(["dns", tun_name, "1.1.1.1", "8.8.8.8"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let mut dns_configured = false;
+    if dns_ok {
+        let _ = Command::new("resolvectl")
+            .args(["domain", tun_name, "~."])
+            .status();
+        let _ = Command::new("resolvectl")
+            .args(["default-route", tun_name, "true"])
+            .status();
+        println!("[+] DNS-серверы (1.1.1.1, 8.8.8.8) настроены через systemd-resolved для '{}'", tun_name);
+        dns_configured = true;
+    }
+
+    Ok((ipv6_blocked, dns_configured))
 }
 
 #[cfg(target_os = "windows")]
 #[allow(dead_code)]
 fn setup_routes(
     _tun_name: &str,
-    server_ip: Ipv4Addr,
+    server_ips: &[Ipv4Addr],
     route_info: &RouteInfo,
-) -> Result<(), TunError> {
+    _tun_gateway: Option<Ipv4Addr>,
+) -> Result<(bool, bool), TunError> {
     if let Some(gw) = route_info.gateway {
-        run_cmd(
-            "route",
-            &[
-                "add",
-                &server_ip.to_string(),
-                "mask",
-                "255.255.255.255",
-                &gw.to_string(),
-            ],
-        )?;
+        for ip in server_ips {
+            let _ = run_cmd(
+                "route",
+                &[
+                    "add",
+                    &ip.to_string(),
+                    "mask",
+                    "255.255.255.255",
+                    &gw.to_string(),
+                ],
+            );
+        }
         run_cmd(
             "route",
             &["add", "0.0.0.0", "mask", "128.0.0.0", &gw.to_string()],
@@ -375,16 +466,17 @@ fn setup_routes(
             &["add", "128.0.0.0", "mask", "128.0.0.0", &gw.to_string()],
         )?;
     }
-    Ok(())
+    Ok((false, false))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn setup_routes(
     _tun_name: &str,
-    _server_ip: Ipv4Addr,
+    _server_ips: &[Ipv4Addr],
     _route_info: &RouteInfo,
-) -> Result<(), TunError> {
-    Ok(())
+    _tun_gateway: Option<Ipv4Addr>,
+) -> Result<(bool, bool), TunError> {
+    Ok((false, false))
 }
 
 #[allow(dead_code)]
