@@ -127,8 +127,8 @@ sudo dnf install -y gcc make pkgconf-pkg-config openssl-devel git
 ### 4.3. Получение исходников
 
 ```bash
-git clone <URL-РЕПОЗИТОРИЯ>/typroxy.git
-cd typroxy
+git clone https://github.com/lohrrrr/TyProxy.git
+cd TyProxy
 ```
 
 ### 4.4. Сборка под текущую платформу
